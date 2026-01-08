@@ -24,7 +24,7 @@ google_client = genai.Client(api_key=GOOGLE_API_KEY)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 MODEL_NAME = "gemini-2.0-flash"
-FINAL_FOLDER = "final_images"
+FINAL_FOLDER = r"C:\Users\tutin\AppData\Roaming\Anki2\User 1\collection.media"
 TEMP_FOLDER = "temp_images"
 CSV_FILE = "ready_for_anki.csv"
 SHEET_NAME = "Anki_Inbox"
