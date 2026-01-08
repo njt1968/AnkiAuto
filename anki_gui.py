@@ -15,32 +15,70 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 import azure.cognitiveservices.speech as speechsdk
+import base64
 
-# --- 1. CONFIGURATION ---
+# --- 1. CONFIGURATION LOADING ---
 load_dotenv()
 
-# Keys
+# LOAD SECRETS
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
 AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION")
 
-# Clients
+# LOAD SETTINGS
+CONFIG_FILE = "config.json"
+
+DEFAULT_CONFIG = {
+    "generation": {
+        "image_mode": "mini", # Options: "mini" or "standard"
+        "azure_voice": "es-MX-JorgeNeural"
+    },
+    "paths": {
+        "anki_media_folder": r"C:\Users\tutin\AppData\Roaming\Anki2\User 1\collection.media",
+        "temp_folder": "temp_images",
+        "output_csv": "ready_for_anki.csv"
+    },
+    "app_settings": {
+        "sheet_name": "Anki_Inbox",
+        "batch_limit": 50,
+        "max_workers": 3
+    }
+}
+
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        print(f"⚠️ {CONFIG_FILE} not found. Using defaults.")
+        return DEFAULT_CONFIG
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            user_config = json.load(f)
+            # Merge with defaults
+            for section, keys in DEFAULT_CONFIG.items():
+                if section not in user_config:
+                    user_config[section] = keys
+                else:
+                    for k, v in keys.items():
+                        if k not in user_config[section]:
+                            user_config[section][k] = v
+            return user_config
+    except Exception as e:
+        print(f"❌ Error reading config.json: {e}")
+        return DEFAULT_CONFIG
+
+CFG = load_config()
+
+# INITIALIZE CLIENTS
 google_client = genai.Client(api_key=GOOGLE_API_KEY)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Settings
-MODEL_NAME = "gemini-2.0-flash"
-AZURE_VOICE_NAME = "es-MX-JorgeNeural" 
-
-# Folders
-FINAL_FOLDER = r"C:\Users\tutin\AppData\Roaming\Anki2\User 1\collection.media"
-
-TEMP_FOLDER = "temp_images"
-CSV_FILE = "ready_for_anki.csv"
-SHEET_NAME = "Anki_Inbox"
-MAX_WORKERS = 3 
-BATCH_LIMIT = 50
+# SHORTCUT VARIABLES
+FINAL_FOLDER = CFG["paths"]["anki_media_folder"]
+TEMP_FOLDER = CFG["paths"]["temp_folder"]
+CSV_FILE = CFG["paths"]["output_csv"]
+SHEET_NAME = CFG["app_settings"]["sheet_name"]
+BATCH_LIMIT = CFG["app_settings"]["batch_limit"]
+MAX_WORKERS = CFG["app_settings"]["max_workers"]
 
 # Ensure folders exist
 for f in [FINAL_FOLDER, TEMP_FOLDER]:
@@ -91,7 +129,8 @@ def generate_text_data(word, hint="None"):
     """
     try:
         response = google_client.models.generate_content(
-            model=MODEL_NAME, contents=prompt,
+            model="gemini-2.0-flash", 
+            contents=prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
         raw = response.text.strip()
@@ -102,33 +141,62 @@ def generate_text_data(word, hint="None"):
     except Exception as e:
         print(f"❌ Text Error ({word}): {e}")
         return None
-
+    
 def generate_image_dalle(scenario, filename, forbidden_word):
     try:
+        mode = CFG["generation"].get("image_mode", "standard").lower()
+        
         safe_prompt = (
-            f"A minimal, 2D vector art illustration. Flat colors, white background. "
-            f"CRITICAL RULE: The image must be completely text-free. "
-            f"Do not include the word '{forbidden_word}'. "
-            f"Do not include any text, letters, numbers, signs. "
-            f"SCENARIO: {scenario}"
+            f"Vector art illustration. White background. No text. "
+            f"Object: {scenario}"
         )
-        response = openai_client.images.generate(
-            model="dall-e-3", prompt=safe_prompt,
-            size="1024x1024", quality="standard", n=1,
-        )
-        img_url = response.data[0].url
-        img_data = requests.get(img_url).content
-        path = os.path.join(TEMP_FOLDER, filename)
-        with open(path, "wb") as f:
-            f.write(img_data)
-        return path, None
+
+        # --- MINI MODE (Bare Bones) ---
+        if mode == "mini":
+            # Strip ALL optional parameters to prevent 400 Errors
+            response = openai_client.images.generate(
+                model="gpt-image-1-mini", 
+                prompt=safe_prompt,
+                n=1,
+            )
+            
+            # Decode Base64
+            if hasattr(response.data[0], 'b64_json') and response.data[0].b64_json:
+                img_data = base64.b64decode(response.data[0].b64_json)
+                path = os.path.join(TEMP_FOLDER, filename)
+                with open(path, "wb") as f:
+                    f.write(img_data)
+                return path, None
+            else:
+                return None, "API returned no data"
+
+        # --- STANDARD MODE (DALL-E 3) ---
+        else:
+            response = openai_client.images.generate(
+                model="dall-e-3", 
+                prompt=safe_prompt,
+                size="1024x1024", 
+                quality="standard",
+                n=1
+            )
+            img_url = response.data[0].url
+            img_data = requests.get(img_url).content
+            path = os.path.join(TEMP_FOLDER, filename)
+            with open(path, "wb") as f:
+                f.write(img_data)
+            return path, None
+
     except BadRequestError as e:
-        print(f"⚠️ BLOCKED: Content Filter triggered for '{filename}'.")
+        print(f"⚠️ OpenAI Error: {e}")
+        # If it's the Mini model, it's likely a parameter issue, not safety.
+        if mode == "mini":
+            return None, "Mini Model Error (Try Standard Mode)"
         return None, "Blocked: Content Filter"
+        
     except Exception as e:
         print(f"❌ Image Error ({filename}): {e}")
         return None, f"Error: {str(e)[:20]}..."
-
+        
 def generate_audio_azure(text, filename):
     if not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION:
         print("❌ CRITICAL: Azure Keys are missing from .env file!")
@@ -136,7 +204,7 @@ def generate_audio_azure(text, filename):
 
     try:
         speech_config = speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, region=AZURE_SPEECH_REGION)
-        speech_config.speech_synthesis_voice_name = AZURE_VOICE_NAME
+        speech_config.speech_synthesis_voice_name = CFG["generation"]["azure_voice"]
         speech_config.set_speech_synthesis_output_format(speechsdk.SpeechSynthesisOutputFormat.Audio16Khz32KBitRateMonoMp3)
         
         path = os.path.join(TEMP_FOLDER, filename)
@@ -158,7 +226,9 @@ class ReviewApp:
     def __init__(self, root, sheet_manager):
         self.root = root
         self.sheet_mgr = sheet_manager
-        self.root.title("Anki Automator")
+        
+        mode = CFG["generation"].get("image_mode", "standard").upper()
+        self.root.title(f"Anki Automator ({mode} MODE)")
         self.root.geometry("900x750")
         
         self.raw_data = self.sheet_mgr.fetch_pending_words()
@@ -281,11 +351,11 @@ class ReviewApp:
         raw = self.word_queue[self.viewing_index]
         word = raw.split("(")[0].strip() if "(" in raw else raw
         
+        # --- HEADER UPDATE ---
         if self.current_word != word:
             self.current_word = word
             self.lbl_word.config(text=word)
             self.lbl_count.config(text=f"Reviewing {self.viewing_index + 1} of {len(self.word_queue)}")
-            
             for v in self.entries.values(): v.delete("1.0", tk.END)
             self.lbl_img.config(image="", text="Loading...")
             self.img_frame.config(bg="#ddd")
@@ -293,6 +363,7 @@ class ReviewApp:
 
         data = self.cache.get(word, {})
 
+        # --- TEXT UPDATE ---
         if "definition" in data:
             current_def = self.entries["Definition"].get("1.0", tk.END).strip()
             if current_def == "" or data.get("force_text_update", False):
@@ -303,27 +374,33 @@ class ReviewApp:
                         v.insert("1.0", val)
                 if "force_text_update" in data: del data["force_text_update"]
 
+        # --- IMAGE UPDATE (STRICT CHECKS) ---
         current_img_path = data.get("image_path")
         error_msg = data.get("image_error")
+        current_lbl_text = self.lbl_img.cget("text")
 
+        # Case A: Success (New Image)
         if current_img_path and getattr(self, "last_loaded_path", "") != current_img_path:
             self.show_image(current_img_path)
             self.last_loaded_path = current_img_path
             self.lbl_img.config(text="")
             self.img_frame.config(bg="#ddd")
+            
+        # Case B: Error (Only update if NOT already showing error)
         elif error_msg:
-            current_lbl = self.lbl_img.cget("text")
-            if "Error" not in current_lbl:
-                self.lbl_img.config(image="", text=f"⚠️ {error_msg}\n\nChange Text & Regen Image", fg="red")
+            # Check if we are ALREADY showing this specific error
+            if error_msg not in current_lbl_text:
+                self.lbl_img.config(image="", text=f"⚠️ {error_msg}\n\nChange Mode or Text", fg="red")
                 self.img_frame.config(bg="#ffcccc")
+
+        # Case C: Loading (Only update if NOT already loading)
         elif not current_img_path and not error_msg:
-             current_lbl = self.lbl_img.cget("text")
-             if "Generating" not in current_lbl and "Loading" not in current_lbl:
+             if "Generating" not in current_lbl_text and "Loading" not in current_lbl_text:
                  self.lbl_img.config(image="", text="Generating...", fg="black")
                  self.img_frame.config(bg="#ddd")
 
         self.after_id = self.root.after(500, self.load_current_view)
-
+        
     def approve(self):
         if "image_error" in self.cache[self.current_word]:
              messagebox.showerror("Blocked", "Image generation failed. Please regenerate before approving.")
@@ -459,9 +536,8 @@ class ReviewApp:
 
 if __name__ == "__main__":
     if not os.path.exists("credentials.json"):
-        print("❌ MISSING credentials.json!")
-    else:
-        root = tk.Tk()
-        sheet_mgr = SheetManager(sheet_name="Anki_Inbox")
-        app = ReviewApp(root, sheet_mgr)
-        root.mainloop()
+        print("⚠️ Config not found. Using internal defaults.")
+    root = tk.Tk()
+    sheet_mgr = SheetManager(sheet_name=SHEET_NAME)
+    app = ReviewApp(root, sheet_mgr)
+    root.mainloop()

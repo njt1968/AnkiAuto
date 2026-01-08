@@ -3,3 +3,5 @@ final_images/
 credentials.json
 ready_for_anki.csv
 temp_images/
+config.json
+test-connection.py
