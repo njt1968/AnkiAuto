@@ -1,272 +1,414 @@
 import tkinter as tk
-from tkinter import messagebox, ttk
-from PIL import Image, ImageTk, ImageDraw
+from tkinter import messagebox
+from PIL import Image, ImageTk
 import os
 import json
 import threading
-import requests  # <--- Make sure this is imported
-from openai import OpenAI  # <--- New import
+import time
+import requests
+import concurrent.futures
+import shutil
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+from openai import OpenAI
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
 # --- 1. CONFIGURATION ---
 load_dotenv()
-API_KEY = os.getenv("GOOGLE_API_KEY")
-client = genai.Client(api_key=API_KEY)
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+google_client = genai.Client(api_key=GOOGLE_API_KEY)
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
 MODEL_NAME = "gemini-2.0-flash"
-
-IMAGE_FOLDER = "final_images"
+FINAL_FOLDER = "final_images"
+TEMP_FOLDER = "temp_images"
 CSV_FILE = "ready_for_anki.csv"
+SHEET_NAME = "Anki_Inbox"
+MAX_WORKERS = 3 
+BATCH_LIMIT = 50  # <--- Safety limit per session
 
-if not os.path.exists(IMAGE_FOLDER):
-    os.makedirs(IMAGE_FOLDER)
+# Ensure folders exist
+for f in [FINAL_FOLDER, TEMP_FOLDER]:
+    if not os.path.exists(f):
+        os.makedirs(f)
 
-# --- 2. BACKEND LOGIC (AI & Images) ---
+# --- 2. GOOGLE SHEETS MANAGER ---
+class SheetManager:
+    def __init__(self, creds_file="credentials.json", sheet_name=SHEET_NAME):
+        self.scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        self.creds = ServiceAccountCredentials.from_json_keyfile_name(creds_file, self.scope)
+        self.client = gspread.authorize(self.creds)
+        self.sheet = self.client.open(sheet_name).sheet1
+
+    def fetch_pending_words(self, limit=BATCH_LIMIT):
+        """Fetches rows where Status is NOT 'Done', up to a limit."""
+        try:
+            records = self.sheet.get_all_records()
+            pending = []
+            
+            for i, row in enumerate(records):
+                if len(pending) >= limit:
+                    break 
+                
+                status = str(row.get("Status", "")).strip().lower()
+                word = str(row.get("Word", "")).strip()
+                
+                if status != "done" and word:
+                    pending.append({"text": word, "row_idx": i + 2})
+            
+            return pending
+        except Exception as e:
+            messagebox.showerror("Sheets Error", f"Could not read sheet: {e}")
+            return []
+
+    def mark_as_done(self, row_idx):
+        try:
+            self.sheet.update_cell(row_idx, 2, "Done")
+        except Exception as e:
+            print(f"❌ Failed to update sheet: {e}")
+
+# --- 3. GENERATION LOGIC ---
 
 def generate_text_data(word, hint="None"):
-    """Calls Gemini to get the linguistic data."""
-    print(f"   ↳ 🧠 Asking Gemini about '{word}'...")
-    
     prompt = f"""
     Task: Create a language flashcard for: "{word}" (Context: {hint}).
     
-    Output a SINGLE JSON object (not a list) with these keys:
-    - definition: Meaning of the word/phrase.
+    Output a SINGLE JSON object with these keys:
+    - definition: STRICTLY just the definition. No grammar notes, no part-of-speech tags, no long explanations. Just the direct meaning.
     - sentence: A natural sentence using it.
     - translation: English translation of that sentence.
-    - scenario: A short visual description for an artist.
+    - scenario: A short visual description for an artist. Do NOT describe any text, signs, words, or speech bubbles in the scene.
     """
     try:
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=prompt,
+        response = google_client.models.generate_content(
+            model=MODEL_NAME, contents=prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
-        
-        # --- CLEANING THE RESPONSE ---
-        raw_text = response.text.strip()
-        
-        # Remove markdown fences if present (e.g., ```json ... ```)
-        if raw_text.startswith("```"):
-            raw_text = raw_text.split("\n", 1)[-1]  # Remove first line
-            if raw_text.endswith("```"):
-                raw_text = raw_text[:-3] # Remove last 3 chars
-
-        parsed = json.loads(raw_text)
-
-        # Handle case where AI returns a list [ {data} ] instead of {data}
-        if isinstance(parsed, list):
-            if len(parsed) > 0:
-                return parsed[0] # Grab the first item
-            else:
-                return None # Empty list
-        
+        raw = response.text.strip()
+        if raw.startswith("```"): raw = raw.split("\n", 1)[-1].rsplit("\n", 1)[0]
+        parsed = json.loads(raw)
+        if isinstance(parsed, list): parsed = parsed[0]
         return parsed
-
     except Exception as e:
-        print(f"❌ Error parsing AI response: {e}")
-        print(f"Raw response was: {response.text}") # Helps debugging
+        print(f"❌ Text Error ({word}): {e}")
         return None
-# --- REPLACEMENT FUNCTIONS ---
 
-def generate_image_real(scenario, filename):
-    """
-    REAL FUNCTION: Calls DALL-E 3 to generate the cartoon.
-    """
-    print(f"   ↳ 🎨 Painting with DALL-E 3: {scenario[:30]}...")
-    
-    # Initialize OpenAI Client (It automatically looks for OPENAI_API_KEY in .env)
-    openai_client = OpenAI()
-
+def generate_image_dalle(scenario, filename, forbidden_word):
     try:
+        # STRONGER ANTI-TEXT PROMPT
+        safe_prompt = (
+            f"A minimal, 2D vector art illustration. Flat colors, white background. "
+            f"CRITICAL RULE: The image must be completely text-free. "
+            f"Do not include the word '{forbidden_word}'. "
+            f"Do not include any text, letters, numbers, signs, labels, or speech bubbles of any kind. "
+            f"SCENARIO: {scenario}"
+        )
         response = openai_client.images.generate(
             model="dall-e-3",
-            prompt=f"A minimal, 2D vector art illustration. Flat colors, white background. No text. {scenario}",
+            prompt=safe_prompt,
             size="1024x1024",
             quality="standard",
             n=1,
         )
-
-        image_url = response.data[0].url
-        
-        # Download the image
-        img_data = requests.get(image_url).content
-        path = os.path.join(IMAGE_FOLDER, filename)
+        img_url = response.data[0].url
+        img_data = requests.get(img_url).content
+        path = os.path.join(TEMP_FOLDER, filename)
         with open(path, "wb") as f:
             f.write(img_data)
-            
         return path
-
     except Exception as e:
-        print(f"❌ Image Gen Failed: {e}")
-        return generate_image_mock(f"ERROR: {e}", filename)
-    
-# Keep a backup mock just in case the API fails (e.g., billing issues)
-def generate_image_mock(scenario, filename):
-    img = Image.new('RGB', (400, 300), color=(200, 100, 100)) # Red for error
-    d = ImageDraw.Draw(img)
-    d.text((10, 10), "IMAGE GEN FAILED", fill=(255, 255, 255))
-    path = os.path.join(IMAGE_FOLDER, filename)
-    img.save(path)
-    return path
+        print(f"❌ Image Error ({filename}): {e}")
+        return None
 
-# --- 3. THE GUI CLASS ---
+# --- 4. THE GUI APP ---
 
 class ReviewApp:
-    def __init__(self, root, word_list):
+    def __init__(self, root, sheet_manager):
         self.root = root
-        self.root.title("Anki Card Reviewer")
-        self.root.geometry("800x600")
+        self.sheet_mgr = sheet_manager
+        self.root.title("Anki Card Reviewer (Final)")
+        self.root.geometry("900x750")
         
-        self.word_queue = word_list
-        self.current_data = {}
-        self.current_word = ""
-        self.current_hint = ""
+        # Load Data
+        self.raw_data = self.sheet_mgr.fetch_pending_words()
+        if not self.raw_data:
+            messagebox.showinfo("Empty", "No pending words found in Sheets!")
+            root.destroy()
+            return
+            
+        self.word_queue = [item["text"] for item in self.raw_data]
+        self.cache = {} 
+        self.current_word = None
+        self.viewing_index = 0
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS)
         
-        # UI Layout
+        self.after_id = None
+        self.is_closing = False
+
         self.setup_ui()
-        
-        # Start first card
-        self.load_next_card()
-    
+        self.start_prefetching()
+        self.load_current_view()
+
     def setup_ui(self):
-        # --- 1. BUTTONS (Pack these FIRST so they stick to the bottom) ---
-        btn_frame = tk.Frame(self.root, bg="#f0f0f0", pady=10)
+        # --- TOP BAR (EXIT BUTTON) ---
+        top_frame = tk.Frame(self.root, bg="#ddd", height=40)
+        top_frame.pack(side="top", fill="x")
+        
+        tk.Button(top_frame, text="🚪 Save & Exit", command=self.exit_app, bg="#ff6666", fg="white", font=("Arial", 10, "bold")).pack(side="right", padx=10, pady=5)
+        
+        # Show count of batch
+        self.lbl_count = tk.Label(top_frame, text=f"Queue: {len(self.word_queue)} words", bg="#ddd", font=("Arial", 10))
+        self.lbl_count.pack(side="left", padx=10)
+
+        # --- BOTTOM BAR (CONTROLS) ---
+        btn_frame = tk.Frame(self.root, bg="#f0f0f0", pady=15)
         btn_frame.pack(side="bottom", fill="x")
 
-        # Define Buttons
-        # Note: On Mac, 'bg' color might not show up on standard buttons. 
-        # If buttons look plain, that is an OS limitation, but they will work.
-        tk.Button(btn_frame, text="🔄 Regen Text", command=self.regen_text, bg="#ffcccb", width=15).pack(side="left", padx=20)
-        tk.Button(btn_frame, text="🎨 Regen Image", command=self.regen_image, bg="#ffd700", width=15).pack(side="left", padx=10)
-        tk.Button(btn_frame, text="✅ APPROVE", command=self.approve, bg="#90ee90", font=("Arial", 12, "bold")).pack(side="right", padx=20)
-
-        # --- 2. MAIN CONTENT AREA (Fills the rest of the space) ---
-        content_frame = tk.Frame(self.root)
-        content_frame.pack(side="top", fill="both", expand=True)
-
-        # Left Side: Image
-        self.image_frame = tk.Frame(content_frame, bg="#ddd", width=400)
-        self.image_frame.pack(side="left", fill="both", expand=True, padx=10, pady=10)
+        self.btn_regen_text = tk.Button(btn_frame, text="🔄 Regen Text", command=self.regen_text, bg="#ffcccb", width=12)
+        self.btn_regen_text.pack(side="left", padx=20)
         
-        self.img_label = tk.Label(self.image_frame, text="Loading Image...", bg="#ddd")
-        self.img_label.pack(expand=True, fill="both")
+        self.btn_regen_img = tk.Button(btn_frame, text="🎨 Regen Image", command=self.regen_image, bg="#ffd700", width=12)
+        self.btn_regen_img.pack(side="left", padx=10)
+        
+        self.lbl_status = tk.Label(btn_frame, text="Initializing...", bg="#f0f0f0", fg="gray", width=40, anchor="w")
+        self.lbl_status.pack(side="left", padx=20)
 
-        # Right Side: Text Fields
-        self.text_frame = tk.Frame(content_frame)
-        self.text_frame.pack(side="right", fill="both", expand=True, padx=10, pady=10)
+        tk.Button(btn_frame, text="✅ APPROVE & NEXT", command=self.approve, bg="#90ee90", font=("Arial", 12, "bold"), padx=20).pack(side="right", padx=20)
 
-        # Word Header
-        self.lbl_word = tk.Label(self.text_frame, text="Target Word", font=("Arial", 18, "bold"), wraplength=300)
-        self.lbl_word.pack(pady=(0, 10), anchor="w")
-
-        # Editable Fields
+        # --- MAIN CONTENT ---
+        content = tk.Frame(self.root)
+        content.pack(side="top", fill="both", expand=True)
+        
+        self.img_frame = tk.Frame(content, bg="#ddd", width=450)
+        self.img_frame.pack(side="left", fill="both", expand=True, padx=10, pady=10)
+        self.lbl_img = tk.Label(self.img_frame, text="Waiting...", bg="#ddd")
+        self.lbl_img.pack(expand=True, fill="both")
+        
+        txt_frame = tk.Frame(content)
+        txt_frame.pack(side="right", fill="both", expand=True, padx=10, pady=10)
+        
+        self.lbl_word = tk.Label(txt_frame, text="Loading...", font=("Arial", 22, "bold"), anchor="w")
+        self.lbl_word.pack(fill="x", pady=(0, 15))
+        
         self.entries = {}
-        fields = ["Definition", "Sentence", "Translation", "Scenario"]
+        for f in ["Definition", "Sentence", "Translation", "Scenario"]:
+            tk.Label(txt_frame, text=f, font=("Arial", 9, "bold"), anchor="w", fg="#555").pack(fill="x")
+            box = tk.Text(txt_frame, height=3 if f != "Scenario" else 2, font=("Arial", 11), wrap="word", relief="flat", bg="#f9f9f9", highlightthickness=1)
+            box.pack(fill="x", pady=(0, 10))
+            self.entries[f] = box
+    
+    def exit_app(self):
+        """Safely closes the app and cleans up temp files."""
+        self.is_closing = True
+        if self.after_id:
+            self.root.after_cancel(self.after_id)
         
-        for f in fields:
-            lbl = tk.Label(self.text_frame, text=f, font=("Arial", 9, "bold"), anchor="w", fg="#555")
-            lbl.pack(fill="x", pady=(5, 0))
+        # --- CLEANUP TEMP FOLDER ---
+        print("🧹 Cleaning up temporary images...")
+        try:
+            for filename in os.listdir(TEMP_FOLDER):
+                file_path = os.path.join(TEMP_FOLDER, filename)
+                if os.path.isfile(file_path):
+                    os.unlink(file_path)
+        except Exception as e:
+            print(f"Cleanup warning: {e}")
+
+        self.root.destroy()
+        print("👋 Exited safely. Pending words saved for next time.")
+
+    def start_prefetching(self):
+        self.update_status(f"🚀 Starting background workers...")
+        for raw in self.word_queue:
+            if "(" in raw:
+                word = raw.split("(")[0].strip()
+                hint = raw.split("(")[1].replace(")", "").strip()
+            else:
+                word = raw
+                hint = "None"
             
-            # Use a slightly shorter height (2) to ensure it fits on smaller screens
-            txt = tk.Text(self.text_frame, height=2, font=("Arial", 11), wrap="word", relief="flat", bg="#f9f9f9", highlightthickness=1, highlightbackground="#ccc")
-            txt.pack(fill="x", pady=(0, 5))
-            self.entries[f] = txt
-            
-    def load_next_card(self):
-        if not self.word_queue:
-            messagebox.showinfo("Done", "All words reviewed!")
+            if word not in self.cache:
+                self.cache[word] = {"status": "pending", "hint": hint}
+            self.executor.submit(self.process_single_card, word, hint)
+
+    def process_single_card(self, word, hint):
+        if "definition" not in self.cache[word]:
+            self.update_status(f"📝 Writing text for '{word}'...")
+            data = generate_text_data(word, hint)
+            if data: self.cache[word].update(data)
+        
+        if "image_path" not in self.cache[word]:
+            scenario = self.cache[word].get("scenario", "")
+            self.update_status(f"🎨 Painting '{word}'...")
+            safe_name = "".join([c for c in word if c.isalnum()]) + f"_{int(time.time())}.png"
+            path = generate_image_dalle(scenario, safe_name, word)
+            if path: 
+                self.cache[word]["image_path"] = path
+                self.update_status(f"✨ Finished '{word}'")
+
+    def load_current_view(self):
+        if self.after_id: self.root.after_cancel(self.after_id)
+        if self.is_closing: return
+
+        if self.viewing_index >= len(self.word_queue):
+            self.is_closing = True
+            messagebox.showinfo("Done", "All cards reviewed!")
             self.root.destroy()
             return
 
-        raw = self.word_queue.pop(0)
-        # Parse Hint
-        if "(" in raw:
-            self.current_word = raw.split("(")[0].strip()
-            self.current_hint = raw.split("(")[1].replace(")", "").strip()
-        else:
-            self.current_word = raw
-            self.current_hint = "None"
-            
-        self.lbl_word.config(text=self.current_word)
-        
-        # Trigger Generation in Thread (so UI doesn't freeze)
-        threading.Thread(target=self.run_generation).start()
+        raw = self.word_queue[self.viewing_index]
+        word = raw.split("(")[0].strip() if "(" in raw else raw
+        self.current_word = word
+        self.lbl_word.config(text=word)
+        self.lbl_count.config(text=f"Reviewing {self.viewing_index + 1} of {len(self.word_queue)}")
 
-    def run_generation(self):
-        # 1. Generate Text
-        data = generate_text_data(self.current_word, self.current_hint)
-        if not data: return
-        
-        # Update UI with Text
-        self.root.after(0, lambda: self.fill_fields(data))
-        
-        # 2. Generate Image
-        self.run_image_gen(data['scenario'])
+        data = self.cache.get(word, {})
 
-    def run_image_gen(self, scenario):
-        filename = f"{self.current_word.replace(' ', '_')}.png"
-        path = generate_image_real(scenario, filename)
-        
-        # Update UI with Image
-        self.root.after(0, lambda: self.show_image(path))
-        self.current_data['image_path'] = path
+        # UPDATE TEXT FIELDS
+        if "definition" in data:
+            current_def = self.entries["Definition"].get("1.0", tk.END).strip()
+            # Only update if field is empty OR forced by regen
+            if current_def == "" or data.get("force_text_update", False):
+                for k, v in self.entries.items():
+                    v.delete("1.0", tk.END)
+                    v.insert("1.0", data.get(k.lower(), ""))
+                if "force_text_update" in data:
+                    del data["force_text_update"] 
 
-    def fill_fields(self, data):
-        self.current_data.update(data)
-        for key, widget in self.entries.items():
-            widget.delete("1.0", tk.END)
-            widget.insert("1.0", data.get(key.lower(), ""))
+        # UPDATE IMAGE
+        current_img_path = data.get("image_path")
+        if current_img_path and getattr(self, "last_loaded_path", "") != current_img_path:
+            self.show_image(current_img_path)
+            self.last_loaded_path = current_img_path
+            self.lbl_img.config(text="")
+        elif not current_img_path:
+             self.lbl_img.config(text="Generating...")
 
-    def show_image(self, path):
-        load = Image.open(path)
-        load = load.resize((400, 300))
-        render = ImageTk.PhotoImage(load)
-        self.img_label.config(image=render, text="")
-        self.img_label.image = render
-
-    def regen_text(self):
-        self.run_generation()
-
-    def regen_image(self):
-        # Grab current scenario from the text box in case user edited it
-        current_scenario = self.entries["Scenario"].get("1.0", tk.END).strip()
-        threading.Thread(target=self.run_image_gen, args=(current_scenario,)).start()
+        self.after_id = self.root.after(500, self.load_current_view)
 
     def approve(self):
-        # Gather final data from text boxes (allows for manual edits)
-        final_data = {
+        if "image_path" not in self.cache[self.current_word]:
+            messagebox.showwarning("Wait", "Image is still generating!")
+            return
+
+        temp_path = self.cache[self.current_word]["image_path"]
+        filename = os.path.basename(temp_path)
+        final_path = os.path.join(FINAL_FOLDER, filename)
+        
+        try:
+            shutil.move(temp_path, final_path)
+        except:
+            shutil.copy(temp_path, final_path)
+
+        data = {
             "Target": self.current_word,
             "Definition": self.entries["Definition"].get("1.0", tk.END).strip(),
             "Sentence": self.entries["Sentence"].get("1.0", tk.END).strip(),
             "Translation": self.entries["Translation"].get("1.0", tk.END).strip(),
             "Scenario": self.entries["Scenario"].get("1.0", tk.END).strip(),
-            "Image": f'<img src="{os.path.basename(self.current_data["image_path"])}">'
+            "Image": f'<img src="{filename}">'
         }
         
-        # Save to CSV
         file_exists = os.path.isfile(CSV_FILE)
         with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
             import csv
-            writer = csv.DictWriter(f, fieldnames=final_data.keys())
+            writer = csv.DictWriter(f, fieldnames=data.keys())
             if not file_exists: writer.writeheader()
-            writer.writerow(final_data)
-            
-        print(f"Saved: {self.current_word}")
-        self.load_next_card()
+            writer.writerow(data)
+        
+        row_id = self.raw_data[self.viewing_index]["row_idx"]
+        threading.Thread(target=self.sheet_mgr.mark_as_done, args=(row_id,)).start()
 
-# --- 4. RUNNER ---
+        print(f"✅ Approved: {self.current_word}")
+        
+        self.viewing_index += 1
+        for v in self.entries.values(): v.delete("1.0", tk.END)
+        self.last_loaded_path = ""
+        self.lbl_img.config(image="", text="Loading next...")
+        self.load_current_view()
+
+    # --- REGENERATION ---
+
+    def regen_image(self):
+        scenario = self.entries["Scenario"].get("1.0", tk.END).strip()
+        word = self.current_word
+        
+        self.update_status(f"🎨 Regenerating image for {word}...")
+        self.lbl_img.config(image="", text="Regenerating...")
+        
+        self.btn_regen_img.config(state="disabled")
+        self.btn_regen_text.config(state="disabled")
+
+        threading.Thread(target=self._do_regen_image, args=(word, scenario)).start()
+
+    def _do_regen_image(self, word, scenario):
+        # 1. DELETE OLD TEMP IMAGE (Garbage Collection)
+        old_path = self.cache[word].get("image_path")
+        if old_path and os.path.exists(old_path):
+            try: 
+                os.remove(old_path)
+                print(f"🗑️ Deleted rejected image: {os.path.basename(old_path)}")
+            except Exception as e:
+                print(f"⚠️ Could not delete old image: {e}")
+
+        # 2. GENERATE NEW ONE
+        safe_name = "".join([c for c in word if c.isalnum()]) + f"_{int(time.time())}.png"
+        path = generate_image_dalle(scenario, safe_name, word)
+        
+        if path:
+            self.cache[word]["image_path"] = path
+            self.root.after(0, lambda: self.finish_regen(path))
+
+    def finish_regen(self, path):
+        self.show_image(path)
+        self.last_loaded_path = path
+        self.update_status("Regeneration complete.")
+        self.btn_regen_img.config(state="normal")
+        self.btn_regen_text.config(state="normal")
+
+    def regen_text(self):
+        word = self.current_word
+        hint = self.cache[word].get("hint", "None")
+        
+        self.update_status(f"📝 Regenerating text for {word}...")
+        self.btn_regen_text.config(state="disabled")
+        
+        threading.Thread(target=self._do_regen_text, args=(word, hint)).start()
+
+    def _do_regen_text(self, word, hint):
+        data = generate_text_data(word, hint)
+        if data:
+            data["force_text_update"] = True 
+            self.cache[word].update(data)
+            self.root.after(0, self._finish_text_regen)
+
+    def _finish_text_regen(self):
+        self.update_status("Text updated.")
+        self.btn_regen_text.config(state="normal")
+
+    def show_image(self, path):
+        try:
+            load = Image.open(path)
+            aspect = load.width / load.height
+            new_w = 450
+            new_h = int(new_w / aspect)
+            load = load.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            render = ImageTk.PhotoImage(load)
+            self.lbl_img.config(image=render)
+            self.lbl_img.image = render
+        except: pass
+
+    def update_status(self, msg):
+        self.root.after(0, lambda: self.lbl_status.config(text=msg))
 
 if __name__ == "__main__":
-    # Load words from file
-    if not os.path.exists("input_words.txt"):
-        with open("input_words.txt", "w") as f:
-            f.write("Gato (animal)\nBanco (seat)")
-            
-    with open("input_words.txt", "r") as f:
-        words = [line.strip() for line in f if line.strip()]
-
-    root = tk.Tk()
-    app = ReviewApp(root, words)
-    root.mainloop()
+    if not os.path.exists("credentials.json"):
+        print("❌ MISSING credentials.json! Please download from Google Cloud.")
+    else:
+        root = tk.Tk()
+        sheet_mgr = SheetManager(sheet_name="Anki_Inbox")
+        app = ReviewApp(root, sheet_mgr)
+        root.mainloop()
