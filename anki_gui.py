@@ -10,22 +10,30 @@ import concurrent.futures
 import shutil
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from openai import OpenAI
+from openai import OpenAI, BadRequestError
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+import azure.cognitiveservices.speech as speechsdk
 
 # --- 1. CONFIGURATION ---
 load_dotenv()
+
+# Keys
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
+AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION")
 
+# Clients
 google_client = genai.Client(api_key=GOOGLE_API_KEY)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
+# Settings
 MODEL_NAME = "gemini-2.0-flash"
+AZURE_VOICE_NAME = "es-MX-JorgeNeural" 
 
-# YOUR ANKI MEDIA FOLDER
+# Folders
 FINAL_FOLDER = r"C:\Users\tutin\AppData\Roaming\Anki2\User 1\collection.media"
 
 TEMP_FOLDER = "temp_images"
@@ -113,24 +121,35 @@ def generate_image_dalle(scenario, filename, forbidden_word):
         path = os.path.join(TEMP_FOLDER, filename)
         with open(path, "wb") as f:
             f.write(img_data)
-        return path
+        return path, None
+    except BadRequestError as e:
+        print(f"⚠️ BLOCKED: Content Filter triggered for '{filename}'.")
+        return None, "Blocked: Content Filter"
     except Exception as e:
         print(f"❌ Image Error ({filename}): {e}")
+        return None, f"Error: {str(e)[:20]}..."
+
+def generate_audio_azure(text, filename):
+    if not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION:
+        print("❌ CRITICAL: Azure Keys are missing from .env file!")
         return None
 
-def generate_audio_openai(text, filename):
-    """Generates MP3 audio for the sentence."""
     try:
-        response = openai_client.audio.speech.create(
-            model="tts-1",
-            voice="alloy",
-            input=text
-        )
+        speech_config = speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, region=AZURE_SPEECH_REGION)
+        speech_config.speech_synthesis_voice_name = AZURE_VOICE_NAME
+        speech_config.set_speech_synthesis_output_format(speechsdk.SpeechSynthesisOutputFormat.Audio16Khz32KBitRateMonoMp3)
+        
         path = os.path.join(TEMP_FOLDER, filename)
-        response.stream_to_file(path)
-        return path
+        audio_config = speechsdk.audio.AudioOutputConfig(filename=path)
+        synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
+        
+        result = synthesizer.speak_text_async(text).get()
+        
+        if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+            return path
+        return None
     except Exception as e:
-        print(f"❌ Audio Error ({filename}): {e}")
+        print(f"❌ Audio Exception ({filename}): {e}")
         return None
 
 # --- 4. THE GUI APP ---
@@ -139,7 +158,7 @@ class ReviewApp:
     def __init__(self, root, sheet_manager):
         self.root = root
         self.sheet_mgr = sheet_manager
-        self.root.title("Anki Automator (Audio on Approve)")
+        self.root.title("Anki Automator")
         self.root.geometry("900x750")
         
         self.raw_data = self.sheet_mgr.fetch_pending_words()
@@ -155,20 +174,19 @@ class ReviewApp:
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS)
         self.after_id = None
         self.is_closing = False
+        self.last_loaded_path = "" 
 
         self.setup_ui()
         self.start_prefetching()
         self.load_current_view()
 
     def setup_ui(self):
-        # TOP BAR
         top_frame = tk.Frame(self.root, bg="#ddd", height=40)
         top_frame.pack(side="top", fill="x")
         tk.Button(top_frame, text="🚪 Save & Exit", command=self.exit_app, bg="#ff6666", fg="white").pack(side="right", padx=10, pady=5)
         self.lbl_count = tk.Label(top_frame, text=f"Queue: {len(self.word_queue)} words", bg="#ddd")
         self.lbl_count.pack(side="left", padx=10)
 
-        # BOTTOM BAR
         btn_frame = tk.Frame(self.root, bg="#f0f0f0", pady=15)
         btn_frame.pack(side="bottom", fill="x")
 
@@ -183,17 +201,14 @@ class ReviewApp:
         self.btn_approve = tk.Button(btn_frame, text="✅ APPROVE & NEXT", command=self.approve, bg="#90ee90", font=("Arial", 12, "bold"), padx=20)
         self.btn_approve.pack(side="right", padx=20)
 
-        # MAIN CONTENT
         content = tk.Frame(self.root)
         content.pack(side="top", fill="both", expand=True)
         
-        # Left Side (Image)
         self.img_frame = tk.Frame(content, bg="#ddd", width=450)
         self.img_frame.pack(side="left", fill="both", expand=True, padx=10, pady=10)
         self.lbl_img = tk.Label(self.img_frame, text="Waiting...", bg="#ddd")
         self.lbl_img.pack(expand=True, fill="both")
         
-        # Right Side (Text)
         txt_frame = tk.Frame(content)
         txt_frame.pack(side="right", fill="both", expand=True, padx=10, pady=10)
         
@@ -210,7 +225,6 @@ class ReviewApp:
     def exit_app(self):
         self.is_closing = True
         if self.after_id: self.root.after_cancel(self.after_id)
-        # Cleanup Temp
         try:
             for filename in os.listdir(TEMP_FOLDER):
                 file_path = os.path.join(TEMP_FOLDER, filename)
@@ -235,21 +249,24 @@ class ReviewApp:
             self.executor.submit(self.process_single_card, word, hint)
 
     def process_single_card(self, word, hint):
-        # 1. Text
         if "definition" not in self.cache[word]:
             self.update_status(f"📝 Writing text for '{word}'...")
             data = generate_text_data(word, hint)
             if data: self.cache[word].update(data)
         
-        # 2. Image
-        if "image_path" not in self.cache[word]:
+        if "image_path" not in self.cache[word] and "image_error" not in self.cache[word]:
             scenario = self.cache[word].get("scenario", "")
             self.update_status(f"🎨 Painting '{word}'...")
+            
             safe_name = "".join([c for c in word if c.isalnum()]) + f"_{int(time.time())}.png"
-            path = generate_image_dalle(scenario, safe_name, word)
+            path, error = generate_image_dalle(scenario, safe_name, word) 
+            
             if path: 
                 self.cache[word]["image_path"] = path
                 self.update_status(f"✨ Ready: '{word}'")
+            elif error:
+                self.cache[word]["image_error"] = error
+                self.update_status(f"⚠️ Error: '{word}'")
 
     def load_current_view(self):
         if self.after_id: self.root.after_cancel(self.after_id)
@@ -263,68 +280,82 @@ class ReviewApp:
 
         raw = self.word_queue[self.viewing_index]
         word = raw.split("(")[0].strip() if "(" in raw else raw
-        self.current_word = word
-        self.lbl_word.config(text=word)
-        self.lbl_count.config(text=f"Reviewing {self.viewing_index + 1} of {len(self.word_queue)}")
+        
+        if self.current_word != word:
+            self.current_word = word
+            self.lbl_word.config(text=word)
+            self.lbl_count.config(text=f"Reviewing {self.viewing_index + 1} of {len(self.word_queue)}")
+            
+            for v in self.entries.values(): v.delete("1.0", tk.END)
+            self.lbl_img.config(image="", text="Loading...")
+            self.img_frame.config(bg="#ddd")
+            self.last_loaded_path = ""
 
         data = self.cache.get(word, {})
 
-        # Text
         if "definition" in data:
             current_def = self.entries["Definition"].get("1.0", tk.END).strip()
             if current_def == "" or data.get("force_text_update", False):
                 for k, v in self.entries.items():
-                    v.delete("1.0", tk.END)
-                    v.insert("1.0", data.get(k.lower(), ""))
+                    val = data.get(k.lower(), "")
+                    if v.get("1.0", tk.END).strip() != val:
+                        v.delete("1.0", tk.END)
+                        v.insert("1.0", val)
                 if "force_text_update" in data: del data["force_text_update"]
 
-        # Image
         current_img_path = data.get("image_path")
+        error_msg = data.get("image_error")
+
         if current_img_path and getattr(self, "last_loaded_path", "") != current_img_path:
             self.show_image(current_img_path)
             self.last_loaded_path = current_img_path
             self.lbl_img.config(text="")
-        elif not current_img_path:
-             self.lbl_img.config(text="Generating...")
+            self.img_frame.config(bg="#ddd")
+        elif error_msg:
+            current_lbl = self.lbl_img.cget("text")
+            if "Error" not in current_lbl:
+                self.lbl_img.config(image="", text=f"⚠️ {error_msg}\n\nChange Text & Regen Image", fg="red")
+                self.img_frame.config(bg="#ffcccc")
+        elif not current_img_path and not error_msg:
+             current_lbl = self.lbl_img.cget("text")
+             if "Generating" not in current_lbl and "Loading" not in current_lbl:
+                 self.lbl_img.config(image="", text="Generating...", fg="black")
+                 self.img_frame.config(bg="#ddd")
 
         self.after_id = self.root.after(500, self.load_current_view)
 
     def approve(self):
+        if "image_error" in self.cache[self.current_word]:
+             messagebox.showerror("Blocked", "Image generation failed. Please regenerate before approving.")
+             return
+        
         if "image_path" not in self.cache[self.current_word]:
             messagebox.showwarning("Wait", "Image is still generating!")
             return
 
-        # Disable button to prevent double clicks
         self.btn_approve.config(state="disabled", text="Saving & Audio...")
-        
-        # Start a thread for the saving process (so UI doesn't freeze during Audio Gen)
         threading.Thread(target=self._approve_worker).start()
 
     def _approve_worker(self):
-        # 1. GENERATE AUDIO (Using current text in box)
         final_sentence = self.entries["Sentence"].get("1.0", tk.END).strip()
         safe_name = "".join([c for c in self.current_word if c.isalnum()]) + f"_{int(time.time())}.mp3"
         
         self.update_status(f"🎤 Generating Audio for '{self.current_word}'...")
-        aud_path = generate_audio_openai(final_sentence, safe_name)
+        aud_path = generate_audio_azure(final_sentence, safe_name)
         aud_name = os.path.basename(aud_path) if aud_path else ""
 
-        # 2. MOVE FILES
         img_temp = self.cache[self.current_word]["image_path"]
         img_name = os.path.basename(img_temp)
-        
-        # Move Image
         img_final = os.path.join(FINAL_FOLDER, img_name)
+        
         try: shutil.move(img_temp, img_final)
         except: shutil.copy(img_temp, img_final)
 
-        # Move Audio (if exists)
         if aud_path:
             aud_final = os.path.join(FINAL_FOLDER, aud_name)
             try: shutil.move(aud_path, aud_final)
             except: shutil.copy(aud_path, aud_final)
 
-        # 3. SAVE CSV
         row_data = {
             "Target": self.current_word,
             "Definition": self.entries["Definition"].get("1.0", tk.END).strip(),
@@ -335,20 +366,16 @@ class ReviewApp:
             "Audio": f'[sound:{aud_name}]' if aud_name else ""
         }
         
-        file_exists = os.path.isfile(CSV_FILE)
+        # --- CSV WRITE (COLON SEPARATOR, NO HEADER) ---
         with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
             import csv
-            writer = csv.DictWriter(f, fieldnames=row_data.keys())
-            if not file_exists: writer.writeheader()
+            writer = csv.DictWriter(f, fieldnames=row_data.keys(), delimiter=':')
             writer.writerow(row_data)
         
-        # 4. SHEET UPDATE
         row_id = self.raw_data[self.viewing_index]["row_idx"]
-        self.sheet_mgr.mark_as_done(row_id) # Call directly in this thread
+        self.sheet_mgr.mark_as_done(row_id)
 
         print(f"✅ Approved: {self.current_word}")
-        
-        # 5. UI RESET (Schedule on main thread)
         self.root.after(0, self._finish_approval)
 
     def _finish_approval(self):
@@ -383,26 +410,35 @@ class ReviewApp:
         word = self.current_word
         self.update_status(f"🎨 Regenerating image for {word}...")
         self.lbl_img.config(image="", text="Regenerating...")
+        self.img_frame.config(bg="#ddd") 
+        
         self.btn_regen_img.config(state="disabled")
         self.btn_regen_text.config(state="disabled")
         threading.Thread(target=self._do_regen_image, args=(word, scenario)).start()
 
     def _do_regen_image(self, word, scenario):
+        if "image_error" in self.cache[word]: del self.cache[word]["image_error"]
         old_path = self.cache[word].get("image_path")
         if old_path and os.path.exists(old_path):
             try: os.remove(old_path)
             except: pass
         
         safe_name = "".join([c for c in word if c.isalnum()]) + f"_{int(time.time())}.png"
-        path = generate_image_dalle(scenario, safe_name, word)
+        path, error = generate_image_dalle(scenario, safe_name, word)
+        self.root.after(0, lambda: self.finish_regen(path, error, word))
+
+    def finish_regen(self, path, error, word):
         if path:
             self.cache[word]["image_path"] = path
-            self.root.after(0, lambda: self.finish_regen(path))
+            self.show_image(path)
+            self.last_loaded_path = path
+            self.update_status("Regeneration complete.")
+        elif error:
+            self.cache[word]["image_error"] = error
+            self.lbl_img.config(text=f"⚠️ {error}\nChange Text & Retry", fg="red")
+            self.img_frame.config(bg="#ffcccc")
+            self.update_status("❌ Image Blocked.")
 
-    def finish_regen(self, path):
-        self.show_image(path)
-        self.last_loaded_path = path
-        self.update_status("Regeneration complete.")
         self.btn_regen_img.config(state="normal")
         self.btn_regen_text.config(state="normal")
 
