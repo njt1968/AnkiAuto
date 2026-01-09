@@ -122,10 +122,10 @@ def generate_text_data(word, hint="None"):
     prompt = f"""
     Task: Create a language flashcard for: "{word}" (Context: {hint}).
     Output a SINGLE JSON object with these keys:
-    - definition: STRICTLY just the definition. No grammar notes.
+    - definition: STRICTLY just the definition IN TARGET LANGUAGE. No grammar notes.
     - sentence: A natural sentence using it in the Target Language.
     - translation: English translation of that sentence.
-    - scenario: A short visual description for an artist. Do NOT describe text/signs.
+    - scenario: A short visual description for an artist IN ENGLISH. Do NOT describe text/signs.
     """
     try:
         response = google_client.models.generate_content(
