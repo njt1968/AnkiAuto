@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, simpledialog 
 from PIL import Image, ImageTk
 import os
 import json
@@ -79,6 +79,13 @@ CSV_FILE = CFG["paths"]["output_csv"]
 SHEET_NAME = CFG["app_settings"]["sheet_name"]
 BATCH_LIMIT = CFG["app_settings"]["batch_limit"]
 MAX_WORKERS = CFG["app_settings"]["max_workers"]
+TARGET_LANGUAGE = CFG["generation"]["target_language"]
+IMG_QUALITY = CFG["generation"]["image_quality"]
+CEFR_LVL = CFG["generation"]["cefr_lvl"]
+SUGGESTED_LENGTH = CFG["generation"]["suggested_length"]
+
+
+
 
 # Ensure folders exist
 for f in [FINAL_FOLDER, TEMP_FOLDER]:
@@ -118,19 +125,32 @@ class SheetManager:
 
 # --- 3. GENERATION LOGIC ---
 
-def generate_text_data(word, hint="None"):
-    prompt = f"""
+# Update the arguments to accept 'instruction'
+def generate_text_data(word, hint="None", instruction=None):
+    
+    # Base prompt
+    base_prompt = f"""
     Task: Create a language flashcard for: "{word}" (Context: {hint}).
+    Target Language: {TARGET_LANGUAGE}
+    """
+
+    # Add the user instruction if it exists
+    if instruction:
+        base_prompt += f"\nIMPORTANT USER INSTRUCTION: {instruction}\n"
+
+    # Rest of the prompt remains the same
+    base_prompt += f"""
     Output a SINGLE JSON object with these keys:
     - definition: STRICTLY just the definition IN TARGET LANGUAGE. No grammar notes.
-    - sentence: A natural sentence using it in the Target Language.
+    - sentence: A natural sentence using it in the Target Language at {CEFR_LVL} Level. Try not to exceed {SUGGESTED_LENGTH} words. 
     - translation: English translation of that sentence.
     - scenario: A short visual description for an artist IN ENGLISH. Do NOT describe text/signs.
     """
+    
     try:
         response = google_client.models.generate_content(
             model="gemini-2.0-flash", 
-            contents=prompt,
+            contents=base_prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
         raw = response.text.strip()
@@ -157,6 +177,7 @@ def generate_image_dalle(scenario, filename, forbidden_word):
             response = openai_client.images.generate(
                 model="gpt-image-1-mini", 
                 prompt=safe_prompt,
+                quality=f"{IMG_QUALITY}",
                 n=1,
             )
             
@@ -467,16 +488,36 @@ class ReviewApp:
     def regen_text(self):
         word = self.current_word
         hint = self.cache[word].get("hint", "None")
+        
+        # 1. Ask user for specific instructions
+        instruction = simpledialog.askstring(
+            "Regenerate Text", 
+            f"Add specific instructions for '{word}'?\n(Leave empty for standard regen)",
+            parent=self.root
+        )
+        
+        # If user hit Cancel, abort
+        if instruction is None: 
+            return
+
         self.update_status(f"📝 Regenerating text for {word}...")
         self.btn_regen_text.config(state="disabled")
-        threading.Thread(target=self._do_regen_text, args=(word, hint)).start()
+        
+        # Pass the instruction to the worker
+        threading.Thread(target=self._do_regen_text, args=(word, hint, instruction)).start()
 
-    def _do_regen_text(self, word, hint):
-        data = generate_text_data(word, hint)
+    # Update the worker signature to accept instruction
+    def _do_regen_text(self, word, hint, instruction):
+        # Pass instruction to generation logic
+        data = generate_text_data(word, hint, instruction)
+        
         if data:
             data["force_text_update"] = True 
             self.cache[word].update(data)
             self.root.after(0, self._finish_text_regen)
+        else:
+            # Handle failure (optional: re-enable button)
+            self.root.after(0, lambda: self.btn_regen_text.config(state="normal"))
 
     def _finish_text_regen(self):
         self.update_status("Text updated.")
