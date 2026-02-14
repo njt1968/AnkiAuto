@@ -6,3 +6,5 @@ temp_images/
 config.json
 test-connection.py
 to_stg.txt
+temp.txt
+archives/

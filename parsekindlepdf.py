@@ -103,7 +103,10 @@ def analyze_with_gemini(word_list):
     try:
         response = google_client.models.generate_content(
             model="gemini-2.5-pro",
-            contents=prompt
+            contents=prompt,
+            config={
+                "response_mime_type": "application/json" 
+            }
         )
         clean_response = response.text.replace("```json", "").replace("```", "").strip()
         return json.loads(clean_response)
@@ -125,9 +128,13 @@ def save_to_sheets(data):
         
         # Prepare rows: [Word, Meaning]
         rows_to_add = []
-        for item in data:
-            rows_to_add.append([item.get('word'), item.get('meaning')])
-            
+        sorted_data = sorted(data, key=lambda x: len(x.get('word', '')), reverse=True)
+
+        for item in sorted_data:
+            # FIX 3: Ensure we handle cases where 'meaning' might be missing
+            word = item.get('word', '')
+            meaning = item.get('meaning', '')
+            rows_to_add.append([word, meaning])
         if rows_to_add:
             sheet.append_rows(rows_to_add)
             print(f"Successfully added {len(rows_to_add)} rows to '{SPREADSHEET_NAME}'.")
@@ -154,6 +161,12 @@ if __name__ == "__main__":
             
             # 4. Save to Sheets
             if analyzed_data:
+                with open("temp.txt", "w") as tempfile:
+                    for a in analyzed_data:
+                        tempfile.write(str(a))
+                        tempfile.write("\n")
+                        
+                    
                 save_to_sheets(analyzed_data)
         else:
             print("No valid words found after cleaning.")

@@ -25,7 +25,7 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
 AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION")
-
+FIREWORKS_API_KEY = os.getenv("FIREWORKS_API_KEY")
 # LOAD SETTINGS
 CONFIG_FILE = "config.json"
 
@@ -161,8 +161,43 @@ def generate_text_data(word, hint="None", instruction=None):
     except Exception as e:
         print(f"❌ Text Error ({word}): {e}")
         return None
-    
-def generate_image_dalle(scenario, filename, forbidden_word):
+
+def generate_image_fireworks(scenario, filename):
+    try:
+        url = "https://api.fireworks.ai/inference/v1/workflows/accounts/fireworks/models/flux-1-schnell-fp8/text_to_image"
+        
+        headers = {
+            "Authorization": f"Bearer {FIREWORKS_API_KEY}",
+            "Content-Type": "application/json",
+            "Accept": "image/jpeg"
+        }
+        
+        payload = {
+            "prompt": f"""
+            2D vector illustration, flat design, SVG style, clean paths, no gradients.
+            Minimalist, professional corporate illustration, thick strokes, bold outlines.
+            White background. No text. 
+            Scenario: {scenario}""",
+            "aspect_ratio": "1:1",
+            "num_inference_steps": 10,
+            "num_images": 1
+        }
+
+        response = requests.post(url, headers=headers, json=payload)
+        
+        if response.status_code == 200:
+            path = os.path.join(TEMP_FOLDER, filename)
+            with open(path, "wb") as f:
+                f.write(response.content)
+            return path, None
+        else:
+            print(f"API Error: {response.status_code}")
+            return None, f"API Error: {response.status_code}"
+
+    except Exception as e:
+        return None, str(e)
+
+def generate_image_dalle(scenario, filename):
     try:
         mode = CFG["generation"].get("image_mode", "standard").lower()
         
@@ -350,7 +385,7 @@ class ReviewApp:
             self.update_status(f"🎨 Painting '{word}'...")
             
             safe_name = "".join([c for c in word if c.isalnum()]) + f"_{int(time.time())}.png"
-            path, error = generate_image_dalle(scenario, safe_name, word) 
+            path, error = generate_image_fireworks(scenario, safe_name) 
             
             if path: 
                 self.cache[word]["image_path"] = path
@@ -542,7 +577,7 @@ class ReviewApp:
             except: pass
         
         safe_name = "".join([c for c in word if c.isalnum()]) + f"_{int(time.time())}.png"
-        path, error = generate_image_dalle(scenario, safe_name, word)
+        path, error = generate_image_fireworks(scenario, safe_name)
         self.root.after(0, lambda: self.finish_regen(path, error, word))
 
     def finish_regen(self, path, error, word):
