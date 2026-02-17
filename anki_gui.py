@@ -144,7 +144,7 @@ def generate_text_data(word, hint="None", instruction=None):
     - definition: STRICTLY just the definition IN TARGET LANGUAGE. No grammar notes.
     - sentence: A natural sentence using it in the Target Language at {CEFR_LVL} Level. Try not to exceed {SUGGESTED_LENGTH} words. 
     - translation: English translation of that sentence.
-    - scenario: A short visual description for an artist IN ENGLISH. Do NOT describe text/signs.
+    - scenario: A vivid visual description for an artist IN ENGLISH. Describe lighting, subject, and environment.
     """
     
     try:
@@ -385,15 +385,29 @@ class ReviewApp:
             self.update_status(f"🎨 Painting '{word}'...")
             
             safe_name = "".join([c for c in word if c.isalnum()]) + f"_{int(time.time())}.png"
-            path, error = generate_image_fireworks(scenario, safe_name) 
             
+            # --- LOGIC: Use Fireworks for first 3, DALL-E for the rest ---
+            # We find the position of the word in the original queue
+            try:
+                # Find index of the word by matching it back to the raw word_queue
+                current_idx = next(i for i, raw in enumerate(self.word_queue) if raw.startswith(word))
+                
+                if current_idx < 3:
+                    path, error = generate_image_fireworks(scenario, safe_name)
+                else:
+                    path, error = generate_image_dalle(scenario, safe_name)
+            except StopIteration:
+                # Fallback to DALL-E if indexing fails
+                path, error = generate_image_dalle(scenario, safe_name)
+            # -------------------------------------------------------------
+
             if path: 
                 self.cache[word]["image_path"] = path
                 self.update_status(f"✨ Ready: '{word}'")
             elif error:
                 self.cache[word]["image_error"] = error
                 self.update_status(f"⚠️ Error: '{word}'")
-
+                
     def load_current_view(self):
         if self.after_id: self.root.after_cancel(self.after_id)
         if self.is_closing: return
