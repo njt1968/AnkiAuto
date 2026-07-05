@@ -138,7 +138,7 @@ def save_to_sheets(data):
         if rows_to_add:
             sheet.append_rows(rows_to_add)
             print(f"Successfully added {len(rows_to_add)} rows to '{SPREADSHEET_NAME}'.")
-        else:
+        else:   
             print("No data to add.")
             
     except Exception as e:

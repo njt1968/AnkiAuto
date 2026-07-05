@@ -16,9 +16,11 @@ from google import genai
 from google.genai import types
 import azure.cognitiveservices.speech as speechsdk
 import base64
+import fal_client
 
 # --- 1. CONFIGURATION LOADING ---
 load_dotenv()
+
 
 # LOAD SECRETS
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -26,13 +28,20 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
 AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION")
 FIREWORKS_API_KEY = os.getenv("FIREWORKS_API_KEY")
+FAL_KEY = os.getenv("FAL_API_KEY")
+
 # LOAD SETTINGS
 CONFIG_FILE = "config.json"
 
 DEFAULT_CONFIG = {
     "generation": {
-        "image_mode": "mini", # Options: "mini" or "standard"
-        "azure_voice": "es-MX-JorgeNeural"
+        "image_mode": "mini",
+        "azure_voice": "es-MX-JorgeNeural",
+        "target_language": "Spanish (MX)",
+        "image_quality": "medium",
+        "cefr_lvl": "B2",
+        "suggested_length": "20",
+        "only_dalle": "n"
     },
     "paths": {
         "anki_media_folder": r"C:\Users\tutin\AppData\Roaming\Anki2\User 1\collection.media",
@@ -110,7 +119,7 @@ class SheetManager:
                 status = str(row.get("Status", "")).strip().lower()
                 word = str(row.get("Word", "")).strip()
                 
-                if status != "done" and word:
+                if status not in ["done", "skipped"] and word:
                     pending.append({"text": word, "row_idx": i + 2})
             return pending
         except Exception as e:
@@ -122,12 +131,17 @@ class SheetManager:
             self.sheet.update_cell(row_idx, 2, "Done")
         except Exception as e:
             print(f"❌ Failed to update sheet: {e}")
+    def mark_as_skipped(self, row_idx):
+        try:
+            self.sheet.update_cell(row_idx, 2, "Skipped")
+        except Exception as e:
+            print(f"❌ Failed to update sheet: {e}")
+                   
 
 # --- 3. GENERATION LOGIC ---
 
 # Update the arguments to accept 'instruction'
 def generate_text_data(word, hint="None", instruction=None):
-    
     # Base prompt
     base_prompt = f"""
     Task: Create a language flashcard for: "{word}" (Context: {hint}).
@@ -149,7 +163,7 @@ def generate_text_data(word, hint="None", instruction=None):
     
     try:
         response = google_client.models.generate_content(
-            model="gemini-2.0-flash", 
+            model="gemini-3.1-flash-lite", 
             contents=base_prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
@@ -161,7 +175,57 @@ def generate_text_data(word, hint="None", instruction=None):
     except Exception as e:
         print(f"❌ Text Error ({word}): {e}")
         return None
+    
 
+def generate_image_fal(scenario, filename):
+    # Optional: callback for real-time progress logs
+    def on_queue_update(update):
+        if isinstance(update, fal_client.InProgress):
+            for log in update.logs:
+                print(f"[fal-ai] {log['message']}")
+
+    try:
+        # Strictly following the docs you provided
+        result = fal_client.subscribe(
+            "fal-ai/flux/schnell",
+            arguments={
+                "prompt": f"""
+                2D vector illustration, flat design, SVG style, clean paths, no gradients.
+                Minimalist, professional corporate illustration, thick strokes, bold outlines.
+                White background. No text. 
+                Scenario: {scenario}""",
+                "image_size": "square",
+                "num_inference_steps": 4,
+                "num_images": 1,
+                "enable_safety_checker": True,
+                "output_format": "jpeg"
+            },
+            with_logs=True,
+            on_queue_update=on_queue_update,
+        )
+
+        # The result schema shows an 'images' list containing a 'url'
+        if result and "images" in result and len(result["images"]) > 0:
+            image_url = result["images"][0]["url"]
+            
+            # Download the image to your local path
+            img_response = requests.get(image_url)
+            if img_response.status_code == 200:
+                # Ensure TEMP_FOLDER is defined in your script
+                path = os.path.join(TEMP_FOLDER, filename)
+                with open(path, "wb") as f:
+                    f.write(img_response.content)
+                return path, None
+            else:
+                return None, f"Failed to download image: {img_response.status_code}"
+        
+        return None, "API call succeeded but no images were returned."
+
+    except Exception as e:
+        # This will catch any validation errors if the library schema changes
+        print(f"Detailed Fal Error: {e}")
+        return None, str(e)
+            
 def generate_image_fireworks(scenario, filename):
     try:
         url = "https://api.fireworks.ai/inference/v1/workflows/accounts/fireworks/models/flux-1-schnell-fp8/text_to_image"
@@ -191,7 +255,7 @@ def generate_image_fireworks(scenario, filename):
                 f.write(response.content)
             return path, None
         else:
-            print(f"API Error: {response.status_code}")
+            print(f"API Error: {response.status_code}: {response.text}")
             return None, f"API Error: {response.status_code}"
 
     except Exception as e:
@@ -252,7 +316,14 @@ def generate_image_dalle(scenario, filename):
     except Exception as e:
         print(f"❌ Image Error ({filename}): {e}")
         return None, f"Error: {str(e)[:20]}..."
-        
+
+def generate_image(scenario, safe_name, model):
+    if model == "fal":
+        return generate_image_fal(scenario, safe_name)
+    else:
+        return generate_image_dalle(scenario, safe_name)        
+
+
 def generate_audio_azure(text, filename):
     if not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION:
         print("❌ CRITICAL: Azure Keys are missing from .env file!")
@@ -297,6 +368,7 @@ class ReviewApp:
         self.cache = {} 
         self.current_word = None
         self.viewing_index = 0
+        self.last_index = -1
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS)
         self.after_id = None
         self.is_closing = False
@@ -321,6 +393,9 @@ class ReviewApp:
         self.btn_regen_img = tk.Button(btn_frame, text="🎨 Regen Image", command=self.regen_image, bg="#ffd700", width=12)
         self.btn_regen_img.pack(side="left", padx=10)
         
+        self.btn_skip = tk.Button(btn_frame, text="⏩ SKIP", command=self.skip_word, bg="#ffb366", width=12)
+        self.btn_skip.pack(side="left", padx=10)
+        
         self.lbl_status = tk.Label(btn_frame, text="Initializing...", bg="#f0f0f0", fg="gray", width=40, anchor="w")
         self.lbl_status.pack(side="left", padx=20)
 
@@ -338,8 +413,15 @@ class ReviewApp:
         txt_frame = tk.Frame(content)
         txt_frame.pack(side="right", fill="both", expand=True, padx=10, pady=10)
         
-        self.lbl_word = tk.Label(txt_frame, text="Loading...", font=("Arial", 22, "bold"), anchor="w")
-        self.lbl_word.pack(fill="x", pady=(0, 15))
+        # self.lbl_word = tk.Label(txt_frame, text="Loading...", font=("Arial", 22, "bold"), anchor="w")
+        # self.lbl_word.pack(fill="x", pady=(0, 15))
+        
+        self.word_entry = tk.Entry(txt_frame, font=("Arial", 22, "bold"), bg="#f0f0f0", bd=0)
+        self.word_entry.pack(fill="x", pady=(0, 15))
+        # This saves the change when you click away or hit enter
+        self.word_entry.bind("<FocusOut>", self.on_word_edited)
+        self.word_entry.bind("<Return>", self.on_word_edited)
+        
         
         self.entries = {}
         for f in ["Definition", "Sentence", "Translation", "Scenario"]:
@@ -349,6 +431,10 @@ class ReviewApp:
             self.entries[f] = box
 
     def exit_app(self):
+        if self.btn_approve.cget("state") == "disabled":
+            if not messagebox.askyesno("Warning", "Save in progress. Exit anyway?"):
+                return
+        
         self.is_closing = True
         if self.after_id: self.root.after_cancel(self.after_id)
         try:
@@ -375,6 +461,8 @@ class ReviewApp:
             self.executor.submit(self.process_single_card, word, hint)
 
     def process_single_card(self, word, hint):
+        if word not in self.cache: 
+            return
         if "definition" not in self.cache[word]:
             self.update_status(f"📝 Writing text for '{word}'...")
             data = generate_text_data(word, hint)
@@ -393,12 +481,12 @@ class ReviewApp:
                 current_idx = next(i for i, raw in enumerate(self.word_queue) if raw.startswith(word))
                 
                 if current_idx < 3:
-                    path, error = generate_image_fireworks(scenario, safe_name)
+                    path, error = generate_image(scenario, safe_name, "fal")
                 else:
-                    path, error = generate_image_dalle(scenario, safe_name)
+                    path, error = generate_image(scenario, safe_name, "fal")
             except StopIteration:
                 # Fallback to DALL-E if indexing fails
-                path, error = generate_image_dalle(scenario, safe_name)
+                path, error = generate_image(scenario, safe_name, "fal")
             # -------------------------------------------------------------
 
             if path: 
@@ -422,16 +510,22 @@ class ReviewApp:
         word = raw.split("(")[0].strip() if "(" in raw else raw
         
         # --- HEADER UPDATE ---
-        if self.current_word != word:
+        if self.last_index != self.viewing_index:
+            self.last_index = self.viewing_index
             self.current_word = word
-            self.lbl_word.config(text=word)
+            
+            self.word_entry.delete(0, tk.END)
+            self.word_entry.insert(0, word)
+            
             self.lbl_count.config(text=f"Reviewing {self.viewing_index + 1} of {len(self.word_queue)}")
             for v in self.entries.values(): v.delete("1.0", tk.END)
             self.lbl_img.config(image="", text="Loading...")
             self.img_frame.config(bg="#ddd")
             self.last_loaded_path = ""
 
-        data = self.cache.get(word, {})
+        # Use the word currently typed in the box for cache lookups
+        lookup_word = self.word_entry.get().strip()
+        data = self.cache.get(lookup_word, self.cache.get(word, {}))
 
         # --- TEXT UPDATE ---
         if "definition" in data:
@@ -472,20 +566,31 @@ class ReviewApp:
         self.after_id = self.root.after(500, self.load_current_view)
         
     def approve(self):
-        if "image_error" in self.cache[self.current_word]:
+        if "image_error" in self.cache.get(self.current_word, {}):
              messagebox.showerror("Blocked", "Image generation failed. Please regenerate before approving.")
              return
         
-        if "image_path" not in self.cache[self.current_word]:
+        if "image_path" not in self.cache.get(self.current_word, {}):
             messagebox.showwarning("Wait", "Image is still generating!")
             return
 
-        self.btn_approve.config(state="disabled", text="Saving & Audio...")
-        threading.Thread(target=self._approve_worker).start()
+        # LOCK UI & STOP REFRESH LOOP
+        self.btn_approve.config(state="disabled", text="Saving...")
+        if self.after_id:
+            self.root.after_cancel(self.after_id)
+            self.after_id = None
 
-    def _approve_worker(self):
+        # Pass the current index to the worker to ensure the correct row is updated
+        idx_to_approve = self.viewing_index
+        threading.Thread(target=self._approve_worker, args=(idx_to_approve,)).start()
+        
+    def _approve_worker(self, row_idx_in_queue):
+        # final_sentence = self.entries["Sentence"].get("1.0", tk.END).strip()
+        # safe_name = "".join([c for c in self.current_word if c.isalnum()]) + f"_{int(time.time())}.mp3"
+        final_word = self.word_entry.get().strip() # Use the text currently in the box
         final_sentence = self.entries["Sentence"].get("1.0", tk.END).strip()
-        safe_name = "".join([c for c in self.current_word if c.isalnum()]) + f"_{int(time.time())}.mp3"
+        safe_name = "".join([c for c in final_word if c.isalnum()]) + f"_{int(time.time())}.mp3"
+        
         
         self.update_status(f"🎤 Generating Audio for '{self.current_word}'...")
         aud_path = generate_audio_azure(final_sentence, safe_name)
@@ -504,7 +609,7 @@ class ReviewApp:
             except: shutil.copy(aud_path, aud_final)
 
         row_data = {
-            "Target": self.current_word,
+            "Target": final_word,
             "Definition": self.entries["Definition"].get("1.0", tk.END).strip(),
             "Sentence": final_sentence,
             "Translation": self.entries["Translation"].get("1.0", tk.END).strip(),
@@ -519,7 +624,7 @@ class ReviewApp:
             writer = csv.DictWriter(f, fieldnames=row_data.keys(), delimiter=':')
             writer.writerow(row_data)
         
-        row_id = self.raw_data[self.viewing_index]["row_idx"]
+        row_id = self.raw_data[row_idx_in_queue]["row_idx"]
         self.sheet_mgr.mark_as_done(row_id)
 
         print(f"✅ Approved: {self.current_word}")
@@ -527,12 +632,59 @@ class ReviewApp:
 
     def _finish_approval(self):
         self.viewing_index += 1
+        self.current_word = None
         for v in self.entries.values(): v.delete("1.0", tk.END)
         self.last_loaded_path = ""
         self.lbl_img.config(image="", text="Loading next...")
         self.btn_approve.config(state="normal", text="✅ APPROVE & NEXT")
         self.load_current_view()
+    def skip_word(self):
+        """Marks the current word as skipped in the sheet and moves to next."""
+        if not self.current_word:
+            return
 
+        if messagebox.askyesno("Skip Word", f"Are you sure you want to skip '{self.current_word}'?"):
+            self.btn_skip.config(state="disabled")
+            threading.Thread(target=self._skip_worker).start()
+
+    def _skip_worker(self):
+        row_id = self.raw_data[self.viewing_index]["row_idx"]
+        self.update_status(f"⏩ Skipping '{self.current_word}'...")
+        
+        # Update Google Sheets
+        self.sheet_mgr.mark_as_skipped(row_id)
+        
+        print(f"⏩ Skipped: {self.current_word}")
+        # Return to main thread to advance the UI
+        self.root.after(0, self._finish_skip)
+
+    def on_word_edited(self, event=None):
+        new_word = self.word_entry.get().strip()
+        
+        if new_word and new_word != self.current_word:
+            old_word = self.current_word
+            
+            # 1. Capture existing data before changing keys
+            old_data = self.cache.get(old_word, {}).copy()
+            
+            # 2. Update tracking variable
+            self.current_word = new_word 
+            
+            # 3. Transfer data to the new key
+            # This ensures 'image_path' is carried over so the prefetcher sees it's 'done'
+            self.cache[new_word] = old_data
+            self.cache[new_word]["force_text_update"] = True
+            
+            self.update_status(f"✏️ Word updated. Image preserved.")
+            
+    def _finish_skip(self):
+        self.btn_skip.config(state="normal")
+        self.viewing_index += 1
+        # Clear entries for next word
+        for v in self.entries.values(): v.delete("1.0", tk.END)
+        self.last_loaded_path = ""
+        self.lbl_img.config(image="", text="Loading next...")
+        self.load_current_view()
     # --- REGENERATION ---
     def regen_text(self):
         word = self.current_word
@@ -591,7 +743,7 @@ class ReviewApp:
             except: pass
         
         safe_name = "".join([c for c in word if c.isalnum()]) + f"_{int(time.time())}.png"
-        path, error = generate_image_fireworks(scenario, safe_name)
+        path, error = generate_image(scenario, safe_name, "fal")
         self.root.after(0, lambda: self.finish_regen(path, error, word))
 
     def finish_regen(self, path, error, word):
